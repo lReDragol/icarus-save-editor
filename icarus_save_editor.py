@@ -258,6 +258,9 @@ class GameBestiaryEntry:
     row_name: str
     display_name: str
     total_points_required: int
+    maps: Tuple[str, ...]
+    biomes: Tuple[str, ...]
+    is_boss: bool
 
 
 @dataclass(frozen=True)
@@ -1710,6 +1713,8 @@ class IcarusGameData:
         self.accolade_order: List[str] = []
         self.bestiary_entries: Dict[str, GameBestiaryEntry] = {}
         self.bestiary_order: List[str] = []
+        self.terrain_names: Dict[str, str] = {}
+        self.terrain_order: List[str] = []
         self.genetic_value_titles: Dict[str, str] = {}
         self.genetic_value_short: Dict[str, str] = {}
         self.genetic_value_order: List[str] = []
@@ -1797,6 +1802,7 @@ class IcarusGameData:
         items_static = self._pak.load_table("/Script/Icarus.ItemStaticData") or {}
         itemable = self._pak.load_table("/Script/Icarus.ItemableData") or {}
         bestiary = self._pak.load_table("/Script/Icarus.BestiaryData") or {}
+        terrains = self._pak.load_table("/Script/Icarus.IcarusTerrain") or {}
         mounts = self._pak.load_table("/Script/Icarus.IcarusMount") or {}
         ai_setup = self._pak.load_table("/Script/Icarus.AISetup") or {}
         world_boss = self._pak.load_table("/Script/Icarus.WorldBossData") or {}
@@ -1838,10 +1844,31 @@ class IcarusGameData:
                     row_name=row_name, display_name=disp, itemable_row=itemable_row
                 )
 
+        self.terrain_names.clear()
+        self.terrain_order = []
+        terrain_rows = terrains.get("Rows", [])
+        if isinstance(terrain_rows, list):
+            for r in terrain_rows:
+                if not isinstance(r, dict):
+                    continue
+                row_name = r.get("Name")
+                if not isinstance(row_name, str) or not row_name:
+                    continue
+                self.terrain_names[row_name] = _resolve_text(
+                    r.get("TerrainName"), self.loc, fallback=row_name
+                )
+                self.terrain_order.append(row_name)
+
         self.creatures.clear()
         self.bestiary_entries = {}
         self.bestiary_order = []
         b_rows = bestiary.get("Rows", [])
+        bestiary_defaults = (
+            bestiary.get("Defaults", {}) if isinstance(bestiary.get("Defaults"), dict) else {}
+        )
+        bestiary_default_points = int(
+            bestiary_defaults.get("TotalPointsRequired", 0) or 0
+        )
         if isinstance(b_rows, list):
             for r in b_rows:
                 if not isinstance(r, dict):
@@ -1856,11 +1883,45 @@ class IcarusGameData:
                 self.creatures[row_name] = GameCreature(
                     row_name=row_name, display_name=display
                 )
-                total_points = int(r.get("TotalPointsRequired", 0) or 0)
+                map_rows: List[str] = []
+                seen_maps: Set[str] = set()
+                for ref in r.get("Maps", []) if isinstance(r.get("Maps"), list) else []:
+                    if not isinstance(ref, dict):
+                        continue
+                    map_row = ref.get("RowName")
+                    if (
+                        isinstance(map_row, str)
+                        and map_row
+                        and map_row not in seen_maps
+                    ):
+                        seen_maps.add(map_row)
+                        map_rows.append(map_row)
+                biome_rows: List[str] = []
+                seen_biomes: Set[str] = set()
+                for ref in (
+                    r.get("Biomes", []) if isinstance(r.get("Biomes"), list) else []
+                ):
+                    if not isinstance(ref, dict):
+                        continue
+                    biome_row = ref.get("RowName")
+                    if (
+                        isinstance(biome_row, str)
+                        and biome_row
+                        and biome_row not in seen_biomes
+                    ):
+                        seen_biomes.add(biome_row)
+                        biome_rows.append(biome_row)
+                total_points = int(
+                    r.get("TotalPointsRequired", bestiary_default_points)
+                    or bestiary_default_points
+                )
                 self.bestiary_entries[row_name] = GameBestiaryEntry(
                     row_name=row_name,
                     display_name=display,
                     total_points_required=total_points,
+                    maps=tuple(map_rows),
+                    biomes=tuple(biome_rows),
+                    is_boss=bool(r.get("bIsBoss", False)),
                 )
                 self.bestiary_order.append(row_name)
 
@@ -6380,6 +6441,20 @@ class AchievementsTab(QWidget):
         ("building", "Строительство"),
         ("general", "Общее"),
     ]
+    BESTIARY_WORLD_ORDER: Tuple[str, ...] = (
+        "Terrain_016",
+        "Terrain_017",
+        "Terrain_019",
+        "Terrain_021",
+    )
+    BESTIARY_WORLD_FALLBACKS: Dict[str, str] = {
+        "Terrain_016": "Olympus",
+        "Terrain_017": "Styx",
+        "Terrain_019": "Prometheus",
+        "Terrain_021": "Elysium",
+        "Space": "Орбита",
+    }
+    BESTIARY_SCOPE_BOSSES = "__world_bosses__"
 
     def __init__(self, model: SaveModel, mark_dirty_cb) -> None:
         super().__init__()
@@ -6388,11 +6463,14 @@ class AchievementsTab(QWidget):
         self._game_data: Optional[IcarusGameData] = None
         self._populating_accolades = False
         self._populating_tracker_tabs: Set[str] = set()
+        self._populating_bestiary_tabs: Set[str] = set()
         self._populating_medals = False
         self._visible_accolade_rows: List[str] = []
         self._visible_tracker_rows: Dict[str, List[str]] = {}
+        self._visible_bestiary_rows: Dict[str, List[str]] = {}
         self._visible_medal_rows: List[str] = []
         self._tracker_pages: Dict[str, Dict[str, Any]] = {}
+        self._bestiary_pages: Dict[str, Dict[str, Any]] = {}
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -6514,6 +6592,23 @@ class AchievementsTab(QWidget):
             self._visible_tracker_rows[key] = []
             self.subtabs.addTab(page, title)
 
+        # --- Bestiary by world ---
+        bestiary_page = QWidget()
+        bestiary_root = QVBoxLayout(bestiary_page)
+        bestiary_root.setContentsMargins(0, 0, 0, 0)
+        bestiary_root.setSpacing(6)
+
+        bestiary_note = QLabel(
+            "Бестиарий по мирам: очки можно править вручную, чекбокс добивает запись до порога медали."
+        )
+        bestiary_note.setStyleSheet("color:#B5BAC1;")
+        bestiary_note.setWordWrap(True)
+        bestiary_root.addWidget(bestiary_note)
+
+        self.bestiary_subtabs = QTabWidget()
+        bestiary_root.addWidget(self.bestiary_subtabs, 1)
+        self.subtabs.addTab(bestiary_page, "Бестиарий")
+
         # --- Medals / bestiary ---
         medals_page = QWidget()
         medals_root = QVBoxLayout(medals_page)
@@ -6560,9 +6655,12 @@ class AchievementsTab(QWidget):
         medals_root.addWidget(self.tbl_medals, 1)
 
         self.subtabs.addTab(medals_page, "Медали")
+        self._rebuild_bestiary_pages()
 
     def set_game_data(self, game_data: Optional[IcarusGameData]) -> None:
         self._game_data = game_data
+        self._rebuild_bestiary_pages()
+        self._refresh_bestiary_views()
 
     def load(self) -> None:
         if not self.model.root:
@@ -6573,11 +6671,12 @@ class AchievementsTab(QWidget):
             )
         else:
             self.info.setText(
-                "Accolades.json хранит достижения и трекеры. BestiaryData.json хранит медали бестиария."
+                "Accolades.json хранит достижения и трекеры. BestiaryData.json хранит медали и бестиарий существ."
             )
         self._apply_accolade_filter()
         for key, _title in self.TRACKER_TABS:
             self._apply_tracker_filter(key)
+        self._refresh_bestiary_views()
         self._apply_medal_filter()
 
     @staticmethod
@@ -6721,6 +6820,126 @@ class AchievementsTab(QWidget):
         self._apply_accolade_filter()
         for key, _title in self.TRACKER_TABS:
             self._apply_tracker_filter(key)
+
+    def _refresh_bestiary_views(self) -> None:
+        for scope_key in list(self._bestiary_pages.keys()):
+            self._apply_bestiary_filter(scope_key)
+
+    def _terrain_display_name(self, terrain_row: str) -> str:
+        rn = (terrain_row or "").strip()
+        if not rn:
+            return ""
+        if rn == "Space":
+            return "Орбита"
+        if self._game_data:
+            title = self._game_data.terrain_names.get(rn, "")
+            if isinstance(title, str) and title.strip():
+                return title.strip()
+        fallback = self.BESTIARY_WORLD_FALLBACKS.get(rn, "")
+        if fallback:
+            return fallback
+        return _pretty_identifier(rn) or rn
+
+    def _bestiary_scope_specs(self) -> List[Tuple[str, str]]:
+        terrain_rows: List[str] = []
+        seen: Set[str] = set()
+        for row_name in self.BESTIARY_WORLD_ORDER:
+            if row_name not in seen:
+                terrain_rows.append(row_name)
+                seen.add(row_name)
+
+        if self._game_data:
+            extra_rows = [
+                row_name
+                for row_name in self._game_data.terrain_order
+                if isinstance(row_name, str)
+                and row_name.startswith("Terrain_")
+                and row_name not in seen
+            ]
+            for row_name in extra_rows:
+                terrain_rows.append(row_name)
+                seen.add(row_name)
+
+        specs = [(row_name, self._terrain_display_name(row_name)) for row_name in terrain_rows]
+        specs.append(("Space", self._terrain_display_name("Space")))
+        specs.append((self.BESTIARY_SCOPE_BOSSES, "Мировые боссы"))
+        return specs
+
+    def _rebuild_bestiary_pages(self) -> None:
+        while self.bestiary_subtabs.count() > 0:
+            page = self.bestiary_subtabs.widget(0)
+            self.bestiary_subtabs.removeTab(0)
+            if page is not None:
+                page.deleteLater()
+        self._bestiary_pages = {}
+        self._visible_bestiary_rows = {}
+        self._populating_bestiary_tabs.clear()
+
+        for scope_key, title in self._bestiary_scope_specs():
+            page = QWidget()
+            lay = QVBoxLayout(page)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(6)
+
+            note = QLabel(
+                "Чекбокс открывает запись, поле очков можно править вручную. Список строится из игрового бестиария."
+            )
+            note.setStyleSheet("color:#B5BAC1;")
+            note.setWordWrap(True)
+            lay.addWidget(note)
+
+            top = QHBoxLayout()
+            top.addWidget(QLabel("Поиск:"))
+            search = QLineEdit()
+            search.setPlaceholderText("Поиск по существу / миру / биому / RowName / числу…")
+            search.textChanged.connect(
+                lambda _text="", scope=scope_key: self._apply_bestiary_filter(scope)
+            )
+            top.addWidget(search, 1)
+            btn_unlock = QPushButton("Открыть всё найденное")
+            btn_unlock.clicked.connect(
+                lambda _checked=False, scope=scope_key: self._unlock_visible_bestiary_rows(
+                    scope
+                )
+            )
+            top.addWidget(btn_unlock)
+            btn_lock = QPushButton("Снять всё найденное")
+            btn_lock.clicked.connect(
+                lambda _checked=False, scope=scope_key: self._lock_visible_bestiary_rows(
+                    scope
+                )
+            )
+            top.addWidget(btn_lock)
+            lay.addLayout(top)
+
+            table = QTableWidget(0, 6)
+            table.setHorizontalHeaderLabels(
+                ["Открыто", "Существо", "Очки", "Нужно", "Биомы", "RowName"]
+            )
+            table.verticalHeader().setVisible(False)
+            table.setSelectionBehavior(QAbstractItemView.SelectRows)
+            table.setEditTriggers(QAbstractItemView.AllEditTriggers)
+            table.setTextElideMode(Qt.ElideNone)
+            table.setAlternatingRowColors(True)
+            hdr = table.horizontalHeader()
+            hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+            hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+            hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+            hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+            table.itemChanged.connect(
+                lambda item, scope=scope_key: self._bestiary_item_changed(scope, item)
+            )
+            lay.addWidget(table, 1)
+
+            self._bestiary_pages[scope_key] = {
+                "page": page,
+                "search": search,
+                "table": table,
+            }
+            self._visible_bestiary_rows[scope_key] = []
+            self.bestiary_subtabs.addTab(page, title)
 
     def _set_accolade_state(self, row_name: str, enabled: bool) -> bool:
         rn = (row_name or "").strip()
@@ -7072,6 +7291,155 @@ class AchievementsTab(QWidget):
             self.mark_dirty()
         self._refresh_achievement_views()
 
+    def _bestiary_tooltip(self, rec: Dict[str, Any]) -> str:
+        lines = [str(rec.get("row_name", "")).strip()]
+        maps_text = str(rec.get("maps_text", "")).strip()
+        biomes_text = str(rec.get("biomes_text", "")).strip()
+        if maps_text:
+            lines.append(f"Миры: {maps_text}")
+        if biomes_text:
+            lines.append(f"Биомы: {biomes_text}")
+        if rec.get("is_boss"):
+            lines.append("Мировой босс")
+        required = int(rec.get("required", 0) or 0)
+        if required > 0:
+            lines.append(f"Нужно очков: {required}")
+        return "\n".join(line for line in lines if line)
+
+    def _bestiary_rows_for_scope(self, scope_key: str) -> List[Dict[str, Any]]:
+        rows = self._medal_rows()
+        if scope_key == self.BESTIARY_SCOPE_BOSSES:
+            return [r for r in rows if r.get("is_boss")]
+        return [r for r in rows if scope_key in tuple(r.get("maps", ()) or ())]
+
+    def _apply_bestiary_filter(self, scope_key: str) -> None:
+        page = self._bestiary_pages.get(scope_key) or {}
+        table = page.get("table")
+        search = page.get("search")
+        if not isinstance(table, QTableWidget) or not isinstance(search, QLineEdit):
+            return
+
+        rows = self._bestiary_rows_for_scope(scope_key)
+        q = search.text().strip().lower()
+        if q:
+            rows = [
+                r
+                for r in rows
+                if self._search_matches(
+                    q,
+                    r["display_name"],
+                    r["row_name"],
+                    r["points"],
+                    r["required"],
+                    r["biomes_text"],
+                    r["maps_text"],
+                    "1" if r["unlocked"] else "0",
+                    "boss" if r["is_boss"] else "",
+                )
+            ]
+
+        self._visible_bestiary_rows[scope_key] = [r["row_name"] for r in rows]
+        self._populating_bestiary_tabs.add(scope_key)
+        try:
+            table.setRowCount(0)
+            for rec in rows:
+                row = table.rowCount()
+                table.insertRow(row)
+
+                it_done = QTableWidgetItem("")
+                it_done.setFlags(
+                    Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable
+                )
+                it_done.setCheckState(Qt.Checked if rec["unlocked"] else Qt.Unchecked)
+                it_done.setData(Qt.UserRole, rec["row_name"])
+                it_done.setData(Qt.UserRole + 1, int(rec["required"]))
+                table.setItem(row, 0, it_done)
+
+                it_name = QTableWidgetItem(rec["display_name"])
+                it_name.setToolTip(self._bestiary_tooltip(rec))
+                it_name.setFlags(it_name.flags() & ~Qt.ItemIsEditable)
+                table.setItem(row, 1, it_name)
+
+                it_points = QTableWidgetItem(str(int(rec["points"])))
+                it_points.setData(Qt.UserRole, rec["row_name"])
+                table.setItem(row, 2, it_points)
+
+                it_required = QTableWidgetItem(str(int(rec["required"])))
+                it_required.setFlags(it_required.flags() & ~Qt.ItemIsEditable)
+                table.setItem(row, 3, it_required)
+
+                it_biomes = QTableWidgetItem(rec["biomes_text"])
+                it_biomes.setToolTip(self._bestiary_tooltip(rec))
+                it_biomes.setFlags(it_biomes.flags() & ~Qt.ItemIsEditable)
+                table.setItem(row, 4, it_biomes)
+
+                it_row = QTableWidgetItem(rec["row_name"])
+                it_row.setFlags(it_row.flags() & ~Qt.ItemIsEditable)
+                table.setItem(row, 5, it_row)
+        finally:
+            self._populating_bestiary_tabs.discard(scope_key)
+
+    def _bestiary_item_changed(
+        self, scope_key: str, item: Optional[QTableWidgetItem]
+    ) -> None:
+        if scope_key in self._populating_bestiary_tabs or not item:
+            return
+
+        changed = False
+        if item.column() == 0:
+            row_name = item.data(Qt.UserRole)
+            required = item.data(Qt.UserRole + 1)
+            if not isinstance(row_name, str) or not row_name:
+                return
+            enabled = item.checkState() in (Qt.Checked, Qt.Checked.value)
+            target = int(required) if isinstance(required, int) and required > 0 else 1
+            changed = self.model.set_bestiary_points(row_name, target if enabled else 0)
+        elif item.column() == 2:
+            row_name = item.data(Qt.UserRole)
+            if not isinstance(row_name, str) or not row_name:
+                return
+            try:
+                points = int(item.text().strip() or "0")
+            except Exception:
+                QMessageBox.warning(
+                    self,
+                    "Бестиарий",
+                    f"Очки для `{row_name}` должны быть целым числом.",
+                )
+                self._apply_bestiary_filter(scope_key)
+                return
+            changed = self.model.set_bestiary_points(row_name, points)
+        else:
+            return
+
+        if changed:
+            self.mark_dirty()
+        self._refresh_bestiary_views()
+        self._apply_medal_filter()
+
+    def _unlock_visible_bestiary_rows(self, scope_key: str) -> None:
+        rows = {r["row_name"]: r for r in self._bestiary_rows_for_scope(scope_key)}
+        changed = False
+        for row_name in self._visible_bestiary_rows.get(scope_key, []):
+            rec = rows.get(row_name)
+            if not rec:
+                continue
+            target = int(rec["required"]) if int(rec["required"]) > 0 else 1
+            changed = self.model.set_bestiary_points(row_name, target) or changed
+        if changed:
+            self.mark_dirty()
+        self._refresh_bestiary_views()
+        self._apply_medal_filter()
+
+    def _lock_visible_bestiary_rows(self, scope_key: str) -> None:
+        changed = False
+        for row_name in self._visible_bestiary_rows.get(scope_key, []):
+            changed = self.model.set_bestiary_points(row_name, 0) or changed
+        if changed:
+            self.mark_dirty()
+        self._refresh_bestiary_views()
+        self._apply_medal_filter()
+
     def _medal_rows(self) -> List[Dict[str, Any]]:
         current = self.model.bestiary_points_map()
         meta_map = self._game_data.bestiary_entries if self._game_data else {}
@@ -7090,6 +7458,10 @@ class AchievementsTab(QWidget):
                 if isinstance(meta, GameBestiaryEntry)
                 else 0
             )
+            maps = tuple(meta.maps) if isinstance(meta, GameBestiaryEntry) else ()
+            biomes = tuple(meta.biomes) if isinstance(meta, GameBestiaryEntry) else ()
+            maps_text = ", ".join(self._terrain_display_name(v) for v in maps if v)
+            biomes_text = ", ".join(_pretty_identifier(v) or v for v in biomes if v)
             points = int(current.get(row_name, 0))
             unlocked = points >= (total_required if total_required > 0 else 1)
             rows.append(
@@ -7099,6 +7471,11 @@ class AchievementsTab(QWidget):
                     "points": points,
                     "required": total_required,
                     "unlocked": unlocked,
+                    "maps": maps,
+                    "biomes": biomes,
+                    "maps_text": maps_text,
+                    "biomes_text": biomes_text,
+                    "is_boss": bool(meta.is_boss) if isinstance(meta, GameBestiaryEntry) else False,
                 }
             )
         rows.sort(key=lambda x: (x["display_name"].lower(), x["row_name"].lower()))
@@ -7117,6 +7494,9 @@ class AchievementsTab(QWidget):
                     r["row_name"],
                     r["points"],
                     r["required"],
+                    r["maps_text"],
+                    r["biomes_text"],
+                    "boss" if r["is_boss"] else "",
                     "1" if r["unlocked"] else "0",
                 )
             ]
@@ -7139,7 +7519,7 @@ class AchievementsTab(QWidget):
                 self.tbl_medals.setItem(row, 0, it_done)
 
                 it_name = QTableWidgetItem(rec["display_name"])
-                it_name.setToolTip(rec["row_name"])
+                it_name.setToolTip(self._bestiary_tooltip(rec))
                 it_name.setFlags(it_name.flags() & ~Qt.ItemIsEditable)
                 self.tbl_medals.setItem(row, 1, it_name)
 
@@ -7188,6 +7568,7 @@ class AchievementsTab(QWidget):
 
         if changed:
             self.mark_dirty()
+        self._refresh_bestiary_views()
         self._apply_medal_filter()
 
     def _unlock_visible_medals(self) -> None:
@@ -7201,6 +7582,7 @@ class AchievementsTab(QWidget):
             changed = self.model.set_bestiary_points(row_name, target) or changed
         if changed:
             self.mark_dirty()
+        self._refresh_bestiary_views()
         self._apply_medal_filter()
 
     def _lock_visible_medals(self) -> None:
@@ -7209,6 +7591,7 @@ class AchievementsTab(QWidget):
             changed = self.model.set_bestiary_points(row_name, 0) or changed
         if changed:
             self.mark_dirty()
+        self._refresh_bestiary_views()
         self._apply_medal_filter()
 
 
